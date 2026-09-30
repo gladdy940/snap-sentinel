@@ -5,7 +5,7 @@
 
 #include <cstddef>
 
-namespace snapsentinel::core {
+namespace snapsentinel::platform::android::qnn {
 
 class DmaMemoryHandle final {
 public:
@@ -56,4 +56,4 @@ public:
     );
 };
 
-}  // namespace snapsentinel::core
+}  // namespace snapsentinel::platform::android::qnn

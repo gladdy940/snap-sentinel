@@ -1,7 +1,19 @@
 # Build
 build/
+/build-*/
+/data_path_experiment.csv
 cmake-build-*/
 out/
+/build*/data_path_experiment.csv
+
+# Temporary and editor backup files
+*.tmp
+*.swp
+*~
+*.bak
+*.orig
+.#*
+\#*#
 
 # Visual Studio
 .vs/
@@ -34,6 +46,8 @@ qnn-sdk/
 
 # Secrets
 .env
+.env.*
+!.env.example
 *.key
 *.pem
 

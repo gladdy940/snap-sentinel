@@ -1,4 +1,4 @@
-#include "snapsentinel/pipeline/async_npu_engine.hpp"
+#include "qnn_inference_engine.hpp"
 
 #include <dlfcn.h>
 
@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace snapsentinel::pipeline {
+namespace snapsentinel::platform::android::qnn {
 namespace {
 
 using GetProvidersFn = Qnn_ErrorHandle_t (*)(
@@ -47,7 +47,7 @@ void checkQnnStatus(const char* operation, const Qnn_ErrorHandle_t status) {
 
 }  // namespace
 
-struct AsyncNpuEngine::State final {
+struct QnnInferenceEngine::State final {
     State(const float threshold, ConfidenceEvaluator evaluator)
         : confidenceThreshold(threshold), confidenceEvaluator(std::move(evaluator)) {}
 
@@ -112,13 +112,27 @@ struct AsyncNpuEngine::State final {
     bool detectionTriggered = false;
 };
 
-struct AsyncNpuEngine::InferenceRequest final {
+struct QnnInferenceEngine::InferenceRequest final {
     std::shared_ptr<State> state;
     Qnn_Tensor_t* outputs = nullptr;
     std::size_t outputCount = 0;
+    inference::InferenceEngine::CompletionCallback completion;
 };
 
-AsyncNpuEngine::AsyncNpuEngine(
+QnnInferenceBatch::QnnInferenceBatch(
+    const Qnn_Tensor_t* const inputTensors,
+    const std::size_t inputTensorCount,
+    Qnn_Tensor_t* const outputTensors,
+    const std::size_t outputTensorCount,
+    std::shared_ptr<const void> owner
+) noexcept
+    : inputs(inputTensors),
+      inputCount(inputTensorCount),
+      outputs(outputTensors),
+      outputCount(outputTensorCount),
+      storageOwner(std::move(owner)) {}
+
+QnnInferenceEngine::QnnInferenceEngine(
     std::string contextBinaryPath,
     std::string graphName,
     ConfidenceEvaluator confidenceEvaluator,
@@ -189,7 +203,7 @@ AsyncNpuEngine::AsyncNpuEngine(
     }
 }
 
-AsyncNpuEngine::~AsyncNpuEngine() {
+QnnInferenceEngine::~QnnInferenceEngine() {
     {
         std::unique_lock lock(state_->queueMutex);
         state_->pendingCondition.wait(lock, [this] { return state_->pendingRequests == 0; });
@@ -236,7 +250,7 @@ AsyncNpuEngine::~AsyncNpuEngine() {
     }
 }
 
-void AsyncNpuEngine::initialize(
+void QnnInferenceEngine::initialize(
     const std::string& contextBinaryPath,
     const std::string& graphName
 ) {
@@ -327,11 +341,21 @@ void AsyncNpuEngine::initialize(
     );
 }
 
-void AsyncNpuEngine::submit(
+void QnnInferenceEngine::submit(
     const Qnn_Tensor_t* const inputs,
     const std::size_t inputCount,
     Qnn_Tensor_t* const outputs,
     const std::size_t outputCount
+) {
+    submit(inputs, inputCount, outputs, outputCount, {});
+}
+
+void QnnInferenceEngine::submit(
+    const Qnn_Tensor_t* const inputs,
+    const std::size_t inputCount,
+    Qnn_Tensor_t* const outputs,
+    const std::size_t outputCount,
+    CompletionCallback completion
 ) {
     if (graph_ == nullptr) {
         throw std::logic_error("QNN graph is not initialized");
@@ -344,7 +368,7 @@ void AsyncNpuEngine::submit(
         throw std::length_error("QNN tensor count exceeds the API limit");
     }
 
-    auto* request = new InferenceRequest{state_, outputs, outputCount};
+    auto* request = new InferenceRequest{state_, outputs, outputCount, std::move(completion)};
     {
         std::lock_guard lock(state_->queueMutex);
         ++state_->pendingRequests;
@@ -359,7 +383,7 @@ void AsyncNpuEngine::submit(
             static_cast<std::uint32_t>(outputCount),
             nullptr,
             nullptr,
-            &AsyncNpuEngine::onQnnExecutionComplete,
+            &QnnInferenceEngine::onQnnExecutionComplete,
             request
         );
     if (status != QNN_SUCCESS) {
@@ -369,7 +393,26 @@ void AsyncNpuEngine::submit(
     }
 }
 
-bool AsyncNpuEngine::waitForDetection(const std::chrono::milliseconds timeout) {
+void QnnInferenceEngine::submit(
+    const inference::PreparedInference& request,
+    CompletionCallback completion
+) {
+    const auto* const qnnRequest = dynamic_cast<const QnnInferenceBatch*>(&request);
+    if (qnnRequest == nullptr || qnnRequest->storageOwner == nullptr) {
+        throw std::invalid_argument(
+            "QNN inference requires a QnnInferenceBatch with owned backing storage"
+        );
+    }
+    submit(
+        qnnRequest->inputs,
+        qnnRequest->inputCount,
+        qnnRequest->outputs,
+        qnnRequest->outputCount,
+        std::move(completion)
+    );
+}
+
+bool QnnInferenceEngine::waitForDetection(const std::chrono::milliseconds timeout) {
     std::unique_lock lock(state_->eventMutex);
     if (!state_->eventCondition.wait_for(
             lock,
@@ -381,7 +424,7 @@ bool AsyncNpuEngine::waitForDetection(const std::chrono::milliseconds timeout) {
     return true;
 }
 
-bool AsyncNpuEngine::waitUntilIdle(const std::chrono::milliseconds timeout) {
+bool QnnInferenceEngine::waitUntilIdle(const std::chrono::milliseconds timeout) {
     std::unique_lock lock(state_->queueMutex);
     return state_->pendingCondition.wait_for(
         lock,
@@ -390,14 +433,14 @@ bool AsyncNpuEngine::waitUntilIdle(const std::chrono::milliseconds timeout) {
     );
 }
 
-void AsyncNpuEngine::onQnnExecutionComplete(
+void QnnInferenceEngine::onQnnExecutionComplete(
     void* const notifyParam,
     const Qnn_NotifyStatus_t notifyStatus
 ) {
     onInferenceComplete(notifyStatus.error, notifyParam);
 }
 
-void AsyncNpuEngine::onInferenceComplete(
+void QnnInferenceEngine::onInferenceComplete(
     const Qnn_ErrorHandle_t status,
     void* const notifyParam
 ) noexcept {
@@ -408,9 +451,11 @@ void AsyncNpuEngine::onInferenceComplete(
     }
 
     const std::shared_ptr<State> state = request->state;
+    std::shared_ptr<InferenceRequest> sharedRequest;
     try {
-        std::shared_ptr<InferenceRequest> sharedRequest(std::move(request));
+        sharedRequest = std::shared_ptr<InferenceRequest>(std::move(request));
         state->enqueue([sharedRequest, state, status] {
+            std::exception_ptr failure;
             try {
                 if (status != QNN_SUCCESS) {
                     std::fprintf(
@@ -418,6 +463,10 @@ void AsyncNpuEngine::onInferenceComplete(
                         "AsyncNpuEngine: inference completed with QNN status 0x%08x\n",
                         static_cast<unsigned int>(status)
                     );
+                    failure = std::make_exception_ptr(std::runtime_error(
+                        "QNN inference completed with status " +
+                        std::to_string(static_cast<unsigned int>(status))
+                    ));
                 } else {
                     const float confidence = state->confidenceEvaluator(
                         sharedRequest->outputs,
@@ -437,20 +486,44 @@ void AsyncNpuEngine::onInferenceComplete(
                     }
                 }
             } catch (const std::exception& error) {
+                failure = std::current_exception();
                 std::fprintf(
                     stderr,
                     "AsyncNpuEngine: confidence evaluation failed: %s\n",
                     error.what()
                 );
             } catch (...) {
+                failure = std::current_exception();
                 std::fprintf(stderr, "AsyncNpuEngine: confidence evaluation failed\n");
+            }
+
+            if (sharedRequest->completion) {
+                try {
+                    sharedRequest->completion(inference::InferenceResult{failure});
+                } catch (const std::exception& error) {
+                    std::fprintf(
+                        stderr,
+                        "AsyncNpuEngine: inference completion handler failed: %s\n",
+                        error.what()
+                    );
+                } catch (...) {
+                    std::fprintf(stderr, "AsyncNpuEngine: inference completion handler failed\n");
+                }
             }
             state->finishRequest();
         });
     } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        if (sharedRequest != nullptr && sharedRequest->completion) {
+            try {
+                sharedRequest->completion(inference::InferenceResult{failure});
+            } catch (...) {
+                std::fprintf(stderr, "AsyncNpuEngine: inference completion handler failed\n");
+            }
+        }
         state->finishRequest();
         std::fprintf(stderr, "AsyncNpuEngine: unable to queue inference completion\n");
     }
 }
 
-}  // namespace snapsentinel::pipeline
+}  // namespace snapsentinel::platform::android::qnn

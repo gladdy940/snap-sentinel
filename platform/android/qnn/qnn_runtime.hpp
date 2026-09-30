@@ -1,6 +1,6 @@
 #pragma once
 
-namespace snapsentinel::core {
+namespace snapsentinel::platform::android::qnn {
 
 class QnnRuntime final {
 public:
@@ -20,4 +20,4 @@ private:
     void* htpLibrary_ = nullptr;
 };
 
-}  // namespace snapsentinel::core
+}  // namespace snapsentinel::platform::android::qnn

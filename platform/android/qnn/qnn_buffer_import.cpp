@@ -2,7 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include "snapsentinel/core/dma_buffer_manager.hpp"
+#include "qnn_buffer_import.hpp"
 
 #include <QnnMem.h>
 
@@ -25,7 +25,7 @@
 #include <sys/syscall.h>
 #endif
 
-namespace snapsentinel::core {
+namespace snapsentinel::platform::android::qnn {
 namespace {
 
 bool isQnnSuccess(const Qnn_ErrorHandle_t status) noexcept {
@@ -238,4 +238,4 @@ DmaMemoryHandle DmaBufferManager::registerWithQnn(
     );
 }
 
-}  // namespace snapsentinel::core
+}  // namespace snapsentinel::platform::android::qnn

@@ -1,4 +1,9 @@
-#include "snapsentinel/pipeline/benchmark_runner.hpp"
+#include "snapsentinel/benchmark/benchmark_runner.hpp"
+
+#include "snapsentinel/inference/inference_engine.hpp"
+#include "snapsentinel/inference/tensor_preparer.hpp"
+#include "snapsentinel/pipeline/camera_capture.hpp"
+#include "snapsentinel/pipeline/frame_pipeline.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +15,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -22,17 +26,6 @@ namespace {
 using BenchmarkClock = std::chrono::high_resolution_clock;
 constexpr auto kSampleInterval = std::chrono::milliseconds(100);
 constexpr auto kMaximumDuration = std::chrono::minutes(30);
-
-struct CpuCounters final {
-    std::uint64_t active = 0;
-    std::uint64_t total = 0;
-};
-
-struct PlatformSample final {
-    double cpuUtilizationPct = 0.0;
-    std::optional<double> temperatureCelsius;
-    bool frequencyThrottled = false;
-};
 
 struct LatencySample final {
     std::uint64_t frameId;
@@ -49,151 +42,6 @@ struct InFlightMeasurement final {
     bool completionReceived = false;
     bool cancelled = false;
 };
-
-std::optional<CpuCounters> readCpuCounters() {
-#if defined(__linux__)
-    std::ifstream statFile("/proc/stat");
-    std::string cpuLabel;
-    CpuCounters counters;
-    std::uint64_t user = 0;
-    std::uint64_t nice = 0;
-    std::uint64_t system = 0;
-    std::uint64_t idle = 0;
-    std::uint64_t iowait = 0;
-    std::uint64_t irq = 0;
-    std::uint64_t softirq = 0;
-    std::uint64_t steal = 0;
-    if (!(statFile >> cpuLabel >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal) ||
-        cpuLabel != "cpu") {
-        return std::nullopt;
-    }
-    counters.active = user + nice + system + irq + softirq + steal;
-    counters.total = counters.active + idle + iowait;
-    return counters;
-#else
-    return std::nullopt;
-#endif
-}
-
-std::optional<double> readThermalTemperature() {
-#if defined(__linux__)
-    constexpr char thermalRoot[] = "/sys/class/thermal";
-    std::error_code error;
-    const std::filesystem::directory_iterator end;
-    double hottestCelsius = -std::numeric_limits<double>::infinity();
-    for (std::filesystem::directory_iterator iterator(
-             thermalRoot,
-             std::filesystem::directory_options::skip_permission_denied,
-             error);
-         !error && iterator != end;
-         iterator.increment(error)) {
-        const std::string name = iterator->path().filename().string();
-        if (name.rfind("thermal_zone", 0) != 0) {
-            continue;
-        }
-
-        std::ifstream temperatureFile(iterator->path() / "temp");
-        long long millidegrees = 0;
-        if (temperatureFile >> millidegrees) {
-            hottestCelsius = std::max(hottestCelsius, static_cast<double>(millidegrees) / 1000.0);
-        }
-    }
-    if (std::isfinite(hottestCelsius)) {
-        return hottestCelsius;
-    }
-#endif
-    return std::nullopt;
-}
-
-#if defined(__linux__)
-std::optional<std::uint64_t> readFrequency(const std::filesystem::path& path) {
-    std::ifstream frequencyFile(path);
-    std::uint64_t value = 0;
-    if (frequencyFile >> value) {
-        return value;
-    }
-    return std::nullopt;
-}
-
-bool readFrequencyThrottling() {
-    constexpr char coolingRoot[] = "/sys/class/thermal";
-    {
-        std::error_code error;
-        const std::filesystem::directory_iterator end;
-        for (std::filesystem::directory_iterator iterator(
-                 coolingRoot,
-                 std::filesystem::directory_options::skip_permission_denied,
-                 error);
-             !error && iterator != end;
-             iterator.increment(error)) {
-            const std::string name = iterator->path().filename().string();
-            if (name.rfind("cooling_device", 0) != 0) {
-                continue;
-            }
-
-            std::ifstream typeFile(iterator->path() / "type");
-            std::string type;
-            std::ifstream stateFile(iterator->path() / "cur_state");
-            unsigned int state = 0;
-            if ((typeFile >> type) && (stateFile >> state) && state > 0 &&
-                (type.find("cpu") != std::string::npos ||
-                 type.find("CPU") != std::string::npos ||
-                 type.find("Processor") != std::string::npos)) {
-                return true;
-            }
-        }
-    }
-
-    constexpr char policyRoot[] = "/sys/devices/system/cpu/cpufreq";
-    std::error_code error;
-    const std::filesystem::directory_iterator end;
-    for (std::filesystem::directory_iterator iterator(
-             policyRoot,
-             std::filesystem::directory_options::skip_permission_denied,
-             error);
-         !error && iterator != end;
-         iterator.increment(error)) {
-        const std::string name = iterator->path().filename().string();
-        if (name.rfind("policy", 0) != 0) {
-            continue;
-        }
-        const auto policyMaximum =
-            readFrequency(iterator->path() / "scaling_max_freq");
-        const auto hardwareMaximum =
-            readFrequency(iterator->path() / "cpuinfo_max_freq");
-        if (policyMaximum.has_value() && hardwareMaximum.has_value() &&
-            *policyMaximum < *hardwareMaximum) {
-            return true;
-        }
-    }
-    return false;
-}
-#else
-bool readFrequencyThrottling() {
-    return false;
-}
-#endif
-
-PlatformSample readPlatformSample(const std::optional<CpuCounters>& previousCounters) {
-    PlatformSample result;
-    result.temperatureCelsius = readThermalTemperature();
-    result.frequencyThrottled = readFrequencyThrottling();
-
-    const std::optional<CpuCounters> currentCounters = readCpuCounters();
-    if (previousCounters.has_value() && currentCounters.has_value()) {
-        if (currentCounters->total < previousCounters->total ||
-            currentCounters->active < previousCounters->active) {
-            return result;
-        }
-        const std::uint64_t totalDelta = currentCounters->total - previousCounters->total;
-        const std::uint64_t activeDelta = currentCounters->active - previousCounters->active;
-        if (totalDelta > 0) {
-            result.cpuUtilizationPct =
-                100.0 * static_cast<double>(activeDelta) / static_cast<double>(totalDelta);
-        }
-    }
-    return result;
-}
 
 std::int64_t timestampMilliseconds() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -212,6 +60,38 @@ double percentile99(const std::vector<double>& values) {
         static_cast<std::size_t>(std::ceil(0.99 * static_cast<double>(sorted.size()))) - 1;
     return sorted[index];
 }
+
+struct PipelineSample final {
+    std::uint64_t frameId;
+    double latencyMs;
+    double inferenceTimeMs;
+    double score;
+    bool succeeded;
+};
+
+class FrameLimitCamera final : public ICameraCapture {
+public:
+    FrameLimitCamera(ICameraCapture& camera, const std::size_t frameLimit)
+        : camera_(camera), frameLimit_(frameLimit) {}
+
+    [[nodiscard]] std::optional<core::CapturedFrame> capture(
+        const std::stop_token stopToken
+    ) override {
+        if (framesCaptured_ >= frameLimit_) {
+            return std::nullopt;
+        }
+        std::optional<core::CapturedFrame> frame = camera_.capture(stopToken);
+        if (frame.has_value()) {
+            ++framesCaptured_;
+        }
+        return frame;
+    }
+
+private:
+    ICameraCapture& camera_;
+    const std::size_t frameLimit_;
+    std::size_t framesCaptured_ = 0;
+};
 
 }  // namespace
 
@@ -265,8 +145,16 @@ std::string BenchmarkOptions::usage(const char* const executableName) {
     return message.str();
 }
 
-BenchmarkRunner::BenchmarkRunner(InferenceSubmitter submitter)
-    : submitter_(std::move(submitter)) {
+BenchmarkRunner::BenchmarkRunner(
+    InferenceSubmitter submitter,
+    std::unique_ptr<benchmark::PlatformMetricsProvider> metricsProvider
+)
+    : submitter_(std::move(submitter)),
+      metricsProvider_(
+          metricsProvider != nullptr
+              ? std::move(metricsProvider)
+              : benchmark::createPlatformMetricsProvider()
+      ) {
     if (!submitter_) {
         throw std::invalid_argument("Benchmark inference submitter must not be empty");
     }
@@ -279,6 +167,128 @@ BenchmarkSummary BenchmarkRunner::runCommandLine(
 ) {
     const BenchmarkOptions options = BenchmarkOptions::parseCommandLine(argc, argv);
     return BenchmarkRunner(std::move(submitter)).run(options);
+}
+
+BenchmarkSummary BenchmarkRunner::runPipeline(
+    ICameraCapture& camera,
+    inference::TensorPreparer& tensorPreparer,
+    inference::InferenceEngine& inferenceEngine,
+    const std::size_t frameCount,
+    const std::filesystem::path& csvPath
+) {
+    if (frameCount == 0) {
+        throw std::invalid_argument("Pipeline benchmark frame count must be greater than zero");
+    }
+    if (csvPath.empty()) {
+        throw std::invalid_argument("Pipeline benchmark CSV path must not be empty");
+    }
+
+    std::ofstream csv(csvPath, std::ios::out | std::ios::trunc);
+    if (!csv) {
+        throw std::runtime_error("Unable to open benchmark CSV: " + csvPath.string());
+    }
+    csv << "Frame_ID,Pipeline_Latency_ms,Inference_Time_ms,Score,Succeeded\n";
+    csv << std::fixed << std::setprecision(6);
+
+    std::mutex samplesMutex;
+    std::condition_variable samplesCondition;
+    std::vector<PipelineSample> samples;
+    samples.reserve(frameCount);
+    FrameLimitCamera limitedCamera(camera, frameCount);
+    FramePipeline pipeline(
+        limitedCamera,
+        tensorPreparer,
+        inferenceEngine,
+        [&](const std::uint64_t frameId, inference::InferenceResult result) {
+            const PipelineSample sample{
+                frameId,
+                std::chrono::duration<double, std::milli>(result.pipelineLatency).count(),
+                std::chrono::duration<double, std::milli>(result.inferenceTime).count(),
+                result.score,
+                result.succeeded()
+            };
+            {
+                std::lock_guard lock(samplesMutex);
+                samples.push_back(sample);
+            }
+            samplesCondition.notify_all();
+        }
+    );
+
+    const auto start = std::chrono::steady_clock::now();
+    pipeline.start();
+    std::unique_lock samplesLock(samplesMutex);
+    const bool receivedAllFrames = samplesCondition.wait_for(
+        samplesLock,
+        std::chrono::seconds(30),
+        [&samples, frameCount] { return samples.size() >= frameCount; }
+    );
+    samplesLock.unlock();
+
+    std::exception_ptr stopFailure;
+    try {
+        pipeline.stop();
+    } catch (...) {
+        stopFailure = std::current_exception();
+    }
+    if (stopFailure != nullptr) {
+        std::rethrow_exception(stopFailure);
+    }
+    if (!receivedAllFrames) {
+        throw std::runtime_error(
+            "Pipeline benchmark timed out before receiving the requested frame count"
+        );
+    }
+    const double elapsedSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    BenchmarkSummary summary;
+    summary.completedFrames = static_cast<std::uint64_t>(samples.size());
+    summary.elapsedSeconds = elapsedSeconds;
+    summary.minLatencyMs = std::numeric_limits<double>::infinity();
+    summary.maxLatencyMs = 0.0;
+    std::vector<double> latencies;
+    latencies.reserve(samples.size());
+    double latencyTotal = 0.0;
+    double inferenceTotal = 0.0;
+    for (const PipelineSample& sample : samples) {
+        csv << sample.frameId << ',' << sample.latencyMs << ','
+            << sample.inferenceTimeMs << ',' << sample.score << ','
+            << (sample.succeeded ? 1 : 0) << '\n';
+        latencies.push_back(sample.latencyMs);
+        latencyTotal += sample.latencyMs;
+        inferenceTotal += sample.inferenceTimeMs;
+        summary.minLatencyMs = std::min(summary.minLatencyMs, sample.latencyMs);
+        summary.maxLatencyMs = std::max(summary.maxLatencyMs, sample.latencyMs);
+        if (!sample.succeeded) {
+            ++summary.failedFrames;
+        }
+    }
+    csv.flush();
+    if (!csv) {
+        throw std::runtime_error("Failed while writing pipeline benchmark CSV");
+    }
+
+    if (!samples.empty()) {
+        summary.meanLatencyMs = latencyTotal / static_cast<double>(samples.size());
+        summary.meanInferenceTimeMs = inferenceTotal / static_cast<double>(samples.size());
+        summary.p99LatencyMs = percentile99(latencies);
+    } else {
+        summary.minLatencyMs = 0.0;
+    }
+    if (elapsedSeconds > 0.0) {
+        summary.framesPerSecond = static_cast<double>(summary.completedFrames) / elapsedSeconds;
+    }
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "Pipeline benchmark completed frames: " << summary.completedFrames << '\n'
+              << "Elapsed time: " << summary.elapsedSeconds << " s\n"
+              << "Latency (avg/min/max): " << summary.meanLatencyMs << " / "
+              << summary.minLatencyMs << " / " << summary.maxLatencyMs << " ms\n"
+              << "Average inference time: " << summary.meanInferenceTimeMs << " ms\n"
+              << "Throughput: " << summary.framesPerSecond << " FPS\n"
+              << "Failed frames: " << summary.failedFrames << '\n';
+    return summary;
 }
 
 BenchmarkSummary BenchmarkRunner::run(const BenchmarkOptions& options) const {
@@ -323,7 +333,6 @@ BenchmarkSummary BenchmarkRunner::run(const BenchmarkOptions& options) const {
     const auto start = BenchmarkClock::now();
     const auto deadline = start + options.duration;
     auto nextSample = start;
-    std::optional<CpuCounters> previousCpuCounters = readCpuCounters();
     double minimumTemperature = std::numeric_limits<double>::infinity();
     double maximumTemperature = -std::numeric_limits<double>::infinity();
 
@@ -382,8 +391,7 @@ BenchmarkSummary BenchmarkRunner::run(const BenchmarkOptions& options) const {
 
             const auto now = BenchmarkClock::now();
             if (now >= nextSample) {
-                const PlatformSample platformSample = readPlatformSample(previousCpuCounters);
-                previousCpuCounters = readCpuCounters();
+                const benchmark::PlatformMetrics platformSample = metricsProvider_->sample();
                 if (platformSample.temperatureCelsius.has_value()) {
                     minimumTemperature =
                         std::min(minimumTemperature, *platformSample.temperatureCelsius);
@@ -401,12 +409,19 @@ BenchmarkSummary BenchmarkRunner::run(const BenchmarkOptions& options) const {
                     sampledFrameId = latestCompletedFrameId;
                 }
                 csv << timestampMilliseconds() << ',' << sampledFrameId << ','
-                    << completionLatency << ',' << dispatchLatency << ','
-                    << platformSample.cpuUtilizationPct << ',';
+                    << completionLatency << ',' << dispatchLatency << ',';
+                if (platformSample.cpuUtilizationPct.has_value()) {
+                    csv << *platformSample.cpuUtilizationPct;
+                }
+                csv << ',';
                 if (platformSample.temperatureCelsius.has_value()) {
                     csv << *platformSample.temperatureCelsius;
                 }
-                csv << ',' << (platformSample.frequencyThrottled ? 1 : 0) << '\n';
+                csv << ',';
+                if (platformSample.cpuThrottled.has_value()) {
+                    csv << (*platformSample.cpuThrottled ? 1 : 0);
+                }
+                csv << '\n';
                 csv.flush();
                 if (!csv) {
                     throw std::runtime_error("Failed while writing benchmark CSV");

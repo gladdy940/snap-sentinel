@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <utility>
 
 namespace snapsentinel::core {
 namespace {
@@ -25,6 +26,16 @@ TEST(BufferAllocatorTest, ProvidesMutableStorage) {
     buffer.bytes()[0] = std::byte{0x2A};
 
     EXPECT_EQ(buffer.bytes()[0], std::byte{0x2A});
+}
+
+TEST(BufferAllocatorTest, MovesOwnershipWithoutCopyingStorage) {
+    Buffer source(8);
+    std::byte* const originalData = source.data();
+
+    Buffer destination(std::move(source));
+
+    EXPECT_EQ(destination.data(), originalData);
+    EXPECT_EQ(destination.size(), 8U);
 }
 
 }  // namespace

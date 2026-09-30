@@ -1,4 +1,4 @@
-#include "snapsentinel/pipeline/benchmark_runner.hpp"
+#include "snapsentinel/benchmark/benchmark_runner.hpp"
 
 #include <gtest/gtest.h>
 

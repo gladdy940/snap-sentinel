@@ -1,4 +1,4 @@
-#include "snapsentinel/core/qnn_runtime.hpp"
+#include "qnn_runtime.hpp"
 
 #include <dlfcn.h>
 
@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace snapsentinel::core {
+namespace snapsentinel::platform::android::qnn {
 namespace {
 
 void* openLibrary(const char* libraryName) {
@@ -70,4 +70,4 @@ bool QnnRuntime::isLoaded() const noexcept {
     return systemLibrary_ != nullptr && htpLibrary_ != nullptr;
 }
 
-}  // namespace snapsentinel::core
+}  // namespace snapsentinel::platform::android::qnn
